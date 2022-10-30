@@ -143,6 +143,10 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         "subsample": [Interval(Real, 0.0, 1.0, closed="right")],
         "verbose": ["verbose"],
         "warm_start": ["boolean"],
+        "backfitting": ["boolean"],
+        "max_backfit_iterations": [Interval(Integral, 0, None, closed="left")],
+        "n_steps_backfit": [Interval(Integral, 1, None, closed="left")],
+        "n_iter_no_change_backfit": [Interval(Integral, 1, None, closed="left"), None],
         "validation_fraction": [Interval(Real, 0.0, 1.0, closed="neither")],
         "n_iter_no_change": [Interval(Integral, 1, None, closed="left"), None],
         "tol": [Interval(Real, 0.0, None, closed="left")],
@@ -171,6 +175,10 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         verbose=0,
         max_leaf_nodes=None,
         warm_start=False,
+        backfitting=True,
+        max_backfit_iterations=0,
+        n_steps_backfit=100,
+        n_iter_no_change_backfit=None,
         validation_fraction=0.1,
         n_iter_no_change=None,
         tol=1e-4,
@@ -194,6 +202,10 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         self.verbose = verbose
         self.max_leaf_nodes = max_leaf_nodes
         self.warm_start = warm_start
+        self.backfitting = backfitting
+        self.max_backfit_iterations = max_backfit_iterations
+        self.n_steps_backfit = n_steps_backfit
+        self.n_iter_no_change_backfit = n_iter_no_change_backfit
         self.validation_fraction = validation_fraction
         self.n_iter_no_change = n_iter_no_change
         self.tol = tol
@@ -201,6 +213,80 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
     @abstractmethod
     def _validate_y(self, y, sample_weight=None):
         """Called by fit to validate y."""
+
+    def _backfit_stage(
+        self,
+        i,
+        X,
+        y,
+        X_val,
+        y_val,
+        raw_predictions,
+        sample_weight,
+        sample_weight_val,
+        sample_mask,
+        random_state,
+    ):
+        """Backfit stages of trees until convergence or early stopping."""
+
+        assert sample_mask.dtype == bool
+        loss = self._loss
+        original_y = y
+
+        if self.n_iter_no_change_backfit is not None:
+            loss_history = np.full(self.n_iter_no_change_backfit, np.inf)
+
+        for k in range(loss.K):
+            if loss.is_multi_class:
+                y = np.array(original_y == k, dtype=np.float64)
+
+            for iter in range(self.max_backfit_iterations):
+                for tree_index in range(max(0, i - self.n_steps_backfit), i + 1):
+                    tree_prediction = self.estimators_[tree_index, k].predict(X).ravel()
+
+                    raw_predictions[:, k] -= self.learning_rate * tree_prediction
+
+                    residual = loss.negative_gradient(
+                        y, raw_predictions, k=k, sample_weight=sample_weight
+                    )
+
+                    if self.subsample < 1.0:
+                        # no inplace multiplication!
+                        sample_weight = sample_weight * sample_mask.astype(np.float64)
+
+                    self.estimators_[tree_index, k].fit(
+                        X, residual, sample_weight=sample_weight, check_input=False
+                    )
+
+                    # update tree leaves
+                    loss.update_terminal_regions(
+                        self.estimators_[tree_index, k].tree_,
+                        X,
+                        y,
+                        residual,
+                        raw_predictions,
+                        sample_weight,
+                        sample_mask,
+                        learning_rate=self.learning_rate,
+                        k=k,
+                    )
+
+                self.train_score_[i, iter + 1] = loss(y, raw_predictions, sample_weight)
+
+                # We also provide an early stopping based on the score from
+                # validation set (X_val, y_val), if n_iter_no_change is set
+                if self.n_iter_no_change_backfit is not None:
+                    y_val_pred_iter = self._raw_predict_up_to(X_val, i)
+                    validation_loss = loss(y_val, y_val_pred_iter, sample_weight_val)
+
+                    # Require validation_score to be better (less) than at least
+                    # one of the last n_iter_no_change evaluations
+                    if np.any(validation_loss + self.tol < loss_history):
+                        loss_history[i % len(loss_history)] = validation_loss
+                    else:
+                        break
+
+        return raw_predictions
 
     def _fit_stage(
         self,
@@ -215,7 +301,6 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         X_csr=None,
     ):
         """Fit another stage of ``_n_classes`` trees to the boosting model."""
-
         assert sample_mask.dtype == bool
         loss = self._loss
         original_y = y
@@ -347,7 +432,9 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
             self.init_ = self._loss.init_estimator()
 
         self.estimators_ = np.empty((self.n_estimators, self._loss.K), dtype=object)
-        self.train_score_ = np.zeros((self.n_estimators,), dtype=np.float64)
+        self.train_score_ = np.zeros(
+            (self.n_estimators, self.max_backfit_iterations + 1), dtype=np.float64
+        )
         # do oob?
         if self.subsample < 1.0:
             self.oob_improvement_ = np.zeros((self.n_estimators), dtype=np.float64)
@@ -378,7 +465,9 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         self.estimators_ = np.resize(
             self.estimators_, (total_n_estimators, self._loss.K)
         )
-        self.train_score_ = np.resize(self.train_score_, total_n_estimators)
+        self.train_score_ = np.resize(
+            self.train_score_, (total_n_estimators, self.max_backfit_iterations + 1)
+        )
         if self.subsample < 1 or hasattr(self, "oob_improvement_"):
             # if do oob resize arrays or create new if not available
             if hasattr(self, "oob_improvement_"):
@@ -459,7 +548,10 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
 
         self._check_params()
 
-        if self.n_iter_no_change is not None:
+        if (
+            self.n_iter_no_change is not None
+            or self.n_iter_no_change_backfit is not None
+        ):
             stratify = y if is_classifier(self) else None
             X, X_val, y, y_val, sample_weight, sample_weight_val = train_test_split(
                 X,
@@ -564,7 +656,7 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         # change shape of arrays after fit (early-stopping or additional ests)
         if n_stages != self.estimators_.shape[0]:
             self.estimators_ = self.estimators_[:n_stages]
-            self.train_score_ = self.train_score_[:n_stages]
+            self.train_score_ = self.train_score_[:n_stages, :]
             if hasattr(self, "oob_improvement_"):
                 self.oob_improvement_ = self.oob_improvement_[:n_stages]
 
@@ -639,7 +731,7 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
 
             # track deviance (= loss)
             if do_oob:
-                self.train_score_[i] = loss_(
+                self.train_score_[i, 0] = loss_(
                     y[sample_mask],
                     raw_predictions[sample_mask],
                     sample_weight[sample_mask],
@@ -651,7 +743,21 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
                 )
             else:
                 # no need to fancy index w/ no subsampling
-                self.train_score_[i] = loss_(y, raw_predictions, sample_weight)
+                self.train_score_[i, 0] = loss_(y, raw_predictions, sample_weight)
+
+            if self.backfitting:
+                raw_predictions = self._backfit_stage(
+                    i,
+                    X,
+                    y,
+                    X_val,
+                    y_val,
+                    raw_predictions,
+                    sample_weight,
+                    sample_weight_val,
+                    sample_mask,
+                    random_state,
+                )
 
             if self.verbose > 0:
                 verbose_reporter.update(i, self)
@@ -699,6 +805,14 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         """Return the sum of the trees raw predictions (+ init estimator)."""
         raw_predictions = self._raw_predict_init(X)
         predict_stages(self.estimators_, X, self.learning_rate, raw_predictions)
+        return raw_predictions
+
+    def _raw_predict_up_to(self, X, i):
+        """Return the sum of the trees raw predictions (+ init estimator)
+        up to the i-th tree.
+        """
+        raw_predictions = self._raw_predict_init(X)
+        predict_stages(self.estimators_[:i], X, self.learning_rate, raw_predictions)
         return raw_predictions
 
     def _staged_raw_predict(self, X, check_input=True):
@@ -1025,6 +1139,30 @@ class GradientBoostingClassifier(ClassifierMixin, BaseGradientBoosting):
         and add more estimators to the ensemble, otherwise, just erase the
         previous solution. See :term:`the Glossary <warm_start>`.
 
+    backfitting : bool, default=False
+        When set to ``True``, retrain the trees tfrom previous steps as well
+        after adding each new estimator to the ensemble, otherwise, keep
+        previous trees fixed. See :term:`the Glossary <backfitting>`.
+
+    max_backfit_iterations : int, default=0
+        Maximum number of backfit iterations to be performed each step of
+        the backfitting. Only takes effect if ``backfitting`` is set to
+        True.
+
+    n_steps_backfit : int, default=100
+        Number of trees to be retrained at each step of the backfitting.
+        Only takes effect if ``backfitting`` is set to True.
+
+    n_iter_no_change_backfit : int, default=None
+        ``n_iter_no_change_backfit`` is used to decide if early stopping will be used
+        to terminate backfit step when validation score is not improving. By
+        default it is set to None to disable early stopping. If set to a
+        number, it will set aside ``validation_fraction`` size of the training
+        data as validation and terminate training when validation score is not
+        improving in all of the previous ``n_iter_no_change_backfit`` numbers of
+        iterations. The split is stratified.
+        Values must be in the range `[1, inf)`.
+
     validation_fraction : float, default=0.1
         The proportion of training data to set aside as validation set for
         early stopping. Values must be in the range `(0.0, 1.0)`.
@@ -1208,6 +1346,10 @@ class GradientBoostingClassifier(ClassifierMixin, BaseGradientBoosting):
         verbose=0,
         max_leaf_nodes=None,
         warm_start=False,
+        backfitting=False,
+        max_backfit_iterations=0,
+        n_steps_backfit=100,
+        n_iter_no_change_backfit=None,
         validation_fraction=0.1,
         n_iter_no_change=None,
         tol=1e-4,
@@ -1231,6 +1373,10 @@ class GradientBoostingClassifier(ClassifierMixin, BaseGradientBoosting):
             max_leaf_nodes=max_leaf_nodes,
             min_impurity_decrease=min_impurity_decrease,
             warm_start=warm_start,
+            backfitting=backfitting,
+            max_backfit_iterations=max_backfit_iterations,
+            n_steps_backfit=n_steps_backfit,
+            n_iter_no_change_backfit=n_iter_no_change_backfit,
             validation_fraction=validation_fraction,
             n_iter_no_change=n_iter_no_change,
             tol=tol,
@@ -1602,6 +1748,30 @@ class GradientBoostingRegressor(RegressorMixin, BaseGradientBoosting):
         and add more estimators to the ensemble, otherwise, just erase the
         previous solution. See :term:`the Glossary <warm_start>`.
 
+    backfitting : bool, default=False
+        When set to ``True``, retrain the trees tfrom previous steps as well
+        after adding each new estimator to the ensemble, otherwise, keep
+        previous trees fixed. See :term:`the Glossary <backfitting>`.
+
+    max_backfit_iterations : int, default=0
+        Maximum number of backfit iterations to be performed each step of
+        the backfitting. Only takes effect if ``backfitting`` is set to
+        True.
+
+    n_steps_backfit : int, default=100
+        Number of trees to be retrained at each step of the backfitting.
+        Only takes effect if ``backfitting`` is set to True.
+
+    n_iter_no_change_backfit : int, default=None
+        ``n_iter_no_change_backfit`` is used to decide if early stopping will be used
+        to terminate backfit step when validation score is not improving. By
+        default it is set to None to disable early stopping. If set to a
+        number, it will set aside ``validation_fraction`` size of the training
+        data as validation and terminate training when validation score is not
+        improving in all of the previous ``n_iter_no_change_backfit`` numbers of
+        iterations. The split is stratified.
+        Values must be in the range `[1, inf)`.
+
     validation_fraction : float, default=0.1
         The proportion of training data to set aside as validation set for
         early stopping. Values must be in the range `(0.0, 1.0)`.
@@ -1772,6 +1942,10 @@ class GradientBoostingRegressor(RegressorMixin, BaseGradientBoosting):
         verbose=0,
         max_leaf_nodes=None,
         warm_start=False,
+        backfitting=False,
+        max_backfit_iterations=0,
+        n_steps_backfit=100,
+        n_iter_no_change_backfit=None,
         validation_fraction=0.1,
         n_iter_no_change=None,
         tol=1e-4,
@@ -1796,6 +1970,10 @@ class GradientBoostingRegressor(RegressorMixin, BaseGradientBoosting):
             verbose=verbose,
             max_leaf_nodes=max_leaf_nodes,
             warm_start=warm_start,
+            backfitting=backfitting,
+            max_backfit_iterations=max_backfit_iterations,
+            n_steps_backfit=n_steps_backfit,
+            n_iter_no_change_backfit=n_iter_no_change_backfit,
             validation_fraction=validation_fraction,
             n_iter_no_change=n_iter_no_change,
             tol=tol,

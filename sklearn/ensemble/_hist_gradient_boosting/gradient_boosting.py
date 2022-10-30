@@ -106,6 +106,7 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
         "max_bins": [Interval(Integral, 2, 255, closed="both")],
         "categorical_features": ["array-like", None],
         "warm_start": ["boolean"],
+        "backfitting": ["boolean"],
         "early_stopping": [StrOptions({"auto"}), "boolean"],
         "scoring": [str, callable, None],
         "verbose": ["verbose"],
@@ -127,6 +128,7 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
         categorical_features,
         monotonic_cst,
         warm_start,
+        backfitting,
         early_stopping,
         scoring,
         validation_fraction,
@@ -146,6 +148,7 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
         self.monotonic_cst = monotonic_cst
         self.categorical_features = categorical_features
         self.warm_start = warm_start
+        self.backfitting = backfitting
         self.early_stopping = early_stopping
         self.scoring = scoring
         self.validation_fraction = validation_fraction
