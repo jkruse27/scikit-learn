@@ -34,6 +34,7 @@ from ._gradient_boosting import predict_stages
 from ._gradient_boosting import predict_stage
 from ._gradient_boosting import _random_sample_mask
 
+import random
 import numpy as np
 
 from scipy.sparse import csc_matrix
@@ -143,7 +144,7 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         "subsample": [Interval(Real, 0.0, 1.0, closed="right")],
         "verbose": ["verbose"],
         "warm_start": ["boolean"],
-        "backfitting": ["boolean"],
+        "backfitting": [StrOptions({"None", "cyclic", "random"})],
         "max_backfit_iterations": [Interval(Integral, 0, None, closed="left")],
         "n_steps_backfit": [Interval(Integral, 1, None, closed="left")],
         "n_iter_no_change_backfit": [Interval(Integral, 1, None, closed="left"), None],
@@ -175,7 +176,7 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         verbose=0,
         max_leaf_nodes=None,
         warm_start=False,
-        backfitting=True,
+        backfitting="None",
         max_backfit_iterations=0,
         n_steps_backfit=100,
         n_iter_no_change_backfit=None,
@@ -226,6 +227,8 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         sample_weight_val,
         sample_mask,
         random_state,
+        X_csc=None,
+        X_csr=None,
     ):
         """Backfit stages of trees until convergence or early stopping."""
 
@@ -236,17 +239,21 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         if self.n_iter_no_change_backfit is not None:
             loss_history = np.full(self.n_iter_no_change_backfit, np.inf)
 
-        for k in range(loss.K):
-            if loss.is_multi_class:
-                y = np.array(original_y == k, dtype=np.float64)
+        for iter in range(self.max_backfit_iterations):
+            for index in range(max(0, i - self.n_steps_backfit), i + 1):
+                tree_index = (
+                    index if self.backfitting == "cyclic" else random.randrange(i)
+                )
+                for k in range(loss.K):
+                    if loss.is_multi_class:
+                        y = np.array(original_y == k, dtype=np.float64)
 
-            for iter in range(self.max_backfit_iterations):
-                for tree_index in range(max(0, i - self.n_steps_backfit), i + 1):
-                    tree_prediction = self.estimators_[tree_index, k].predict(X).ravel()
+                    raw_predictions[:, k] = self._raw_predict_estimators(
+                        X, self.estimators_[: i + 1][np.arange(i + 1) != tree_index]
+                    ).reshape(raw_predictions[:, k].shape)
 
-                    raw_predictions[:, k] -= self.learning_rate * tree_prediction
-
-                    residual = loss.negative_gradient(
+                    learning_rate = self.learning_rate if tree_index != 0 else 1
+                    residual = learning_rate * loss.negative_gradient(
                         y, raw_predictions, k=k, sample_weight=sample_weight
                     )
 
@@ -254,6 +261,7 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
                         # no inplace multiplication!
                         sample_weight = sample_weight * sample_mask.astype(np.float64)
 
+                    X = X_csr if X_csr is not None else X
                     self.estimators_[tree_index, k].fit(
                         X, residual, sample_weight=sample_weight, check_input=False
                     )
@@ -267,24 +275,24 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
                         raw_predictions,
                         sample_weight,
                         sample_mask,
-                        learning_rate=self.learning_rate,
+                        learning_rate=1,
                         k=k,
                     )
 
-                self.train_score_[i, iter + 1] = loss(y, raw_predictions, sample_weight)
+            self.train_score_[i, iter + 1] = loss(y, raw_predictions, sample_weight)
 
-                # We also provide an early stopping based on the score from
-                # validation set (X_val, y_val), if n_iter_no_change is set
-                if self.n_iter_no_change_backfit is not None:
-                    y_val_pred_iter = self._raw_predict_up_to(X_val, i)
-                    validation_loss = loss(y_val, y_val_pred_iter, sample_weight_val)
+            # We also provide an early stopping based on the score from
+            # validation set (X_val, y_val), if n_iter_no_change is set
+            if self.n_iter_no_change_backfit is not None:
+                y_val_pred_iter = self._raw_predict_up_to(X_val, i)
+                validation_loss = loss(y_val, y_val_pred_iter, sample_weight_val)
 
-                    # Require validation_score to be better (less) than at least
-                    # one of the last n_iter_no_change evaluations
-                    if np.any(validation_loss + self.tol < loss_history):
-                        loss_history[i % len(loss_history)] = validation_loss
-                    else:
-                        break
+                # Require validation_score to be better (less) than at least
+                # one of the last n_iter_no_change evaluations
+                if np.any(validation_loss + self.tol < loss_history):
+                    loss_history[i % len(loss_history)] = validation_loss
+                else:
+                    break
 
         return raw_predictions
 
@@ -315,7 +323,8 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
             if loss.is_multi_class:
                 y = np.array(original_y == k, dtype=np.float64)
 
-            residual = loss.negative_gradient(
+            learning_rate = self.learning_rate if i != 0 else 1
+            residual = learning_rate * loss.negative_gradient(
                 y, raw_predictions_copy, k=k, sample_weight=sample_weight
             )
 
@@ -350,7 +359,7 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
                 raw_predictions,
                 sample_weight,
                 sample_mask,
-                learning_rate=self.learning_rate,
+                learning_rate=1,
                 k=k,
             )
 
@@ -745,7 +754,7 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
                 # no need to fancy index w/ no subsampling
                 self.train_score_[i, 0] = loss_(y, raw_predictions, sample_weight)
 
-            if self.backfitting:
+            if self.backfitting and i != 0:
                 raw_predictions = self._backfit_stage(
                     i,
                     X,
@@ -757,6 +766,8 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
                     sample_weight_val,
                     sample_mask,
                     random_state,
+                    X_csc,
+                    X_csr,
                 )
 
             if self.verbose > 0:
@@ -801,10 +812,18 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
             )
         return raw_predictions
 
+    def _raw_predict_estimators(self, X, estimators):
+        """Return the sum of the trees raw predictions (+ init estimator)."""
+        raw_predictions = self._raw_predict_init(X)
+        predict_stages(estimators, X, 1, raw_predictions)
+        # predict_stages(estimators, X, self.learning_rate, raw_predictions)
+        return raw_predictions
+
     def _raw_predict(self, X):
         """Return the sum of the trees raw predictions (+ init estimator)."""
         raw_predictions = self._raw_predict_init(X)
-        predict_stages(self.estimators_, X, self.learning_rate, raw_predictions)
+        predict_stages(self.estimators_, X, 1, raw_predictions)
+        # predict_stages(self.estimators_, X, self.learning_rate, raw_predictions)
         return raw_predictions
 
     def _raw_predict_up_to(self, X, i):
@@ -812,7 +831,8 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         up to the i-th tree.
         """
         raw_predictions = self._raw_predict_init(X)
-        predict_stages(self.estimators_[:i], X, self.learning_rate, raw_predictions)
+        predict_stages(self.estimators_[:i], X, 1, raw_predictions)
+        # predict_stages(self.estimators_[:i], X, self.learning_rate, raw_predictions)
         return raw_predictions
 
     def _staged_raw_predict(self, X, check_input=True):
@@ -845,7 +865,8 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
             )
         raw_predictions = self._raw_predict_init(X)
         for i in range(self.estimators_.shape[0]):
-            predict_stage(self.estimators_, i, X, self.learning_rate, raw_predictions)
+            predict_stage(self.estimators_, i, X, 1, raw_predictions)
+            # predict_stage(self.estimators_, i, X, self.learning_rate, raw_predictions)
             yield raw_predictions.copy()
 
     @property
@@ -1139,10 +1160,14 @@ class GradientBoostingClassifier(ClassifierMixin, BaseGradientBoosting):
         and add more estimators to the ensemble, otherwise, just erase the
         previous solution. See :term:`the Glossary <warm_start>`.
 
-    backfitting : bool, default=False
-        When set to ``True``, retrain the trees tfrom previous steps as well
-        after adding each new estimator to the ensemble, otherwise, keep
-        previous trees fixed. See :term:`the Glossary <backfitting>`.
+    backfitting : {"None", "cyclic", "random"}, default="None"
+        When set to ``"None"``, works as normal backfitting, else retrains
+        the trees tfrom previous steps as well after adding each new estimator
+        to the ensemble, otherwise, keep previous trees fixed. See
+        :term:`the Glossary <backfitting>`. "cyclic" options means the backfitting
+        iterations are done in a cyclic manner through the already trained estimators,
+        while "random" means that each backfitting iteration retrains the estimators
+        randomly.
 
     max_backfit_iterations : int, default=0
         Maximum number of backfit iterations to be performed each step of
@@ -1324,6 +1349,7 @@ class GradientBoostingClassifier(ClassifierMixin, BaseGradientBoosting):
         "loss": [
             StrOptions({"log_loss", "deviance", "exponential"}, deprecated={"deviance"})
         ],
+        "backfitting": [StrOptions({"None", "cyclic", "random"})],
         "init": [StrOptions({"zero"}), None, HasMethods(["fit", "predict_proba"])],
     }
 
@@ -1346,7 +1372,7 @@ class GradientBoostingClassifier(ClassifierMixin, BaseGradientBoosting):
         verbose=0,
         max_leaf_nodes=None,
         warm_start=False,
-        backfitting=False,
+        backfitting="None",
         max_backfit_iterations=0,
         n_steps_backfit=100,
         n_iter_no_change_backfit=None,
@@ -1748,10 +1774,14 @@ class GradientBoostingRegressor(RegressorMixin, BaseGradientBoosting):
         and add more estimators to the ensemble, otherwise, just erase the
         previous solution. See :term:`the Glossary <warm_start>`.
 
-    backfitting : bool, default=False
-        When set to ``True``, retrain the trees tfrom previous steps as well
-        after adding each new estimator to the ensemble, otherwise, keep
-        previous trees fixed. See :term:`the Glossary <backfitting>`.
+    backfitting : {"None", "cyclic", "random"}, default="None"
+        When set to ``"None"``, works as normal backfitting, else retrains
+        the trees tfrom previous steps as well after adding each new estimator
+        to the ensemble, otherwise, keep previous trees fixed. See
+        :term:`the Glossary <backfitting>`. "cyclic" options means the backfitting
+        iterations are done in a cyclic manner through the already trained estimators,
+        while "random" means that each backfitting iteration retrains the estimators
+        randomly.
 
     max_backfit_iterations : int, default=0
         Maximum number of backfit iterations to be performed each step of
@@ -1918,6 +1948,7 @@ class GradientBoostingRegressor(RegressorMixin, BaseGradientBoosting):
                 deprecated={"ls", "lad"},
             )
         ],
+        "backfitting": [StrOptions({"None", "cyclic", "random"})],
         "init": [StrOptions({"zero"}), None, HasMethods(["fit", "predict"])],
         "alpha": [Interval(Real, 0.0, 1.0, closed="neither")],
     }
@@ -1942,7 +1973,7 @@ class GradientBoostingRegressor(RegressorMixin, BaseGradientBoosting):
         verbose=0,
         max_leaf_nodes=None,
         warm_start=False,
-        backfitting=False,
+        backfitting="None",
         max_backfit_iterations=0,
         n_steps_backfit=100,
         n_iter_no_change_backfit=None,
